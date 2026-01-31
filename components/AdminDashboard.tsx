@@ -1,17 +1,68 @@
 
-import React, { useState, useMemo } from 'react';
-import { Trial } from '../types';
+import React, { useState, useMemo, useEffect } from 'react';
+import { Trial, UserRole, LogEntry } from '../types';
+import { supabase } from '../lib/supabase';
 
 interface AdminDashboardProps {
   trials: Trial[];
-  onUpdate: (updatedTrials: Trial[]) => void;
+  role: UserRole;
+  onUpdate: () => void;
   onLogout: () => void;
 }
 
-const AdminDashboard: React.FC<AdminDashboardProps> = ({ trials, onUpdate, onLogout }) => {
+interface AdminProfile {
+  user_id: string;
+  role: string;
+  email?: string;
+}
+
+const AdminDashboard: React.FC<AdminDashboardProps> = ({ trials, role, onUpdate, onLogout }) => {
+  const [activeTab, setActiveTab] = useState<'data' | 'profiles' | 'logs'>('data');
   const [search, setSearch] = useState('');
   const [editingTrial, setEditingTrial] = useState<Trial | null>(null);
-  const [editForm, setEditForm] = useState<Trial | null>(null);
+  const [editForm, setEditForm] = useState<Partial<Trial> | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
+  
+  const [profiles, setProfiles] = useState<AdminProfile[]>([]);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [isLogsLoading, setIsLogsLoading] = useState(false);
+
+  useEffect(() => {
+    if (activeTab === 'profiles' && role === 'super_admin') {
+      fetchProfiles();
+    }
+    if (activeTab === 'logs' && role === 'super_admin') {
+      fetchLogs();
+    }
+  }, [activeTab]);
+
+  const fetchProfiles = async () => {
+    const { data } = await supabase.from('admin_users').select('*');
+    setProfiles(data || []);
+  };
+
+  const fetchLogs = async () => {
+    setIsLogsLoading(true);
+    const { data, error } = await supabase
+      .from('logs')
+      .select('*')
+      .order('created_at', { ascending: false });
+    
+    if (!error) setLogs(data || []);
+    setIsLogsLoading(false);
+  };
+
+  const logAction = async (action: string, details: any) => {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return;
+
+    await supabase.from('logs').insert([{
+      user_id: user.id,
+      user_email: user.email,
+      action: action,
+      details: details
+    }]);
+  };
 
   const filtered = useMemo(() => {
     const q = search.toLowerCase();
@@ -27,199 +78,303 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ trials, onUpdate, onLog
     setEditForm({ ...trial });
   };
 
-  const handleFormChange = (field: keyof Trial, value: any) => {
-    if (!editForm) return;
-    setEditForm({ ...editForm, [field]: value });
-  };
-
-  const handleSave = () => {
-    if (!editForm) return;
-    const newTrials = trials.map(t => t.id === editForm.id ? editForm : t);
-    onUpdate(newTrials);
+  const handleAddNew = () => {
+    const newTrial: Partial<Trial> = {
+      title: '新临床试验项目',
+      department: '肿瘤内科',
+      pi: '未指定',
+      disease: '未指定适应症',
+      tags: [],
+      criteria: '请在此输入标准...',
+      contact: '联系人：\n电话：'
+    };
     setEditingTrial(null);
-    setEditForm(null);
-    alert('修改已保存在内存中，记得导出 JSON 以持久化！');
+    setEditForm(newTrial);
   };
 
-  const exportJSON = () => {
-    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(trials, null, 2));
-    const downloadAnchorNode = document.createElement('a');
-    downloadAnchorNode.setAttribute("href", dataStr);
-    downloadAnchorNode.setAttribute("download", "clinical_trials_search_db.json");
-    document.body.appendChild(downloadAnchorNode);
-    downloadAnchorNode.click();
-    downloadAnchorNode.remove();
+  const handleSaveTrial = async () => {
+    if (!editForm) return;
+    setIsSaving(true);
+    try {
+      let error;
+      const isUpdate = !!editForm.id;
+      
+      if (isUpdate) {
+        const { error: updateError } = await supabase.from('trials').update(editForm).eq('id', editForm.id);
+        error = updateError;
+      } else {
+        const { error: insertError } = await supabase.from('trials').insert([editForm]);
+        error = insertError;
+      }
+      
+      if (error) throw error;
+      
+      // 记录日志
+      await logAction(
+        isUpdate ? `修改试验项目: ${editForm.title}` : `创建新试验项目: ${editForm.title}`,
+        { trial_id: editForm.id, disease: editForm.disease }
+      );
+
+      onUpdate();
+      setEditingTrial(null);
+      setEditForm(null);
+      alert('云端同步成功并记录审计日志！');
+    } catch (err: any) {
+      alert('保存失败: ' + err.message);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const exportCSV = () => {
+    const headers = ['ID', '科室', '研究者(PI)', '项目标题', '适应症', '标签', '详细标准', '联系方式'];
+    const rows = trials.map(t => [t.id, t.department, t.pi, t.title, t.disease, t.tags?.join('; ') || '', t.criteria, t.contact]);
+    const csvString = [headers.join(','), ...rows.map(row => row.map(cell => `"${String(cell ?? '').replace(/"/g, '""')}"`).join(','))].join('\n');
+    const blob = new Blob(['\ufeff' + csvString], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.setAttribute('href', url);
+    link.setAttribute('download', `DATA_EXPORT.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
   };
 
   return (
-    <div className="flex flex-col h-screen bg-slate-900 text-slate-300">
-      {/* 顶部栏 */}
-      <header className="h-16 bg-slate-800 border-b border-slate-700 flex items-center justify-between px-6 shrink-0">
-        <div className="flex items-center gap-4">
-          <div className="bg-blue-600 p-1.5 rounded-lg text-white">
-            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-            </svg>
+    <div className="flex h-screen bg-slate-950 text-slate-300">
+      <aside className="w-72 bg-slate-900 border-r border-slate-800 flex flex-col shrink-0">
+        <div className="p-8 border-b border-slate-800 flex items-center gap-4">
+          <div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center text-white shadow-xl shadow-indigo-600/30">
+            <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>
           </div>
-          <h1 className="text-white font-bold tracking-tight">实验数据库后台管理</h1>
-        </div>
-        <div className="flex items-center gap-4">
-          <button 
-            onClick={exportJSON}
-            className="px-4 py-1.5 bg-emerald-600 text-white text-xs font-bold rounded-lg hover:bg-emerald-500 transition-colors flex items-center gap-2"
-          >
-            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-            </svg>
-            导出数据库 (JSON)
-          </button>
-          <button 
-            onClick={onLogout}
-            className="text-slate-400 hover:text-white transition-colors"
-          >
-            退出登录
-          </button>
-        </div>
-      </header>
-
-      <div className="flex-1 flex overflow-hidden">
-        {/* 左侧列表 */}
-        <div className="w-96 border-r border-slate-700 flex flex-col bg-slate-800/50">
-          <div className="p-4 border-b border-slate-700">
-            <input 
-              type="text"
-              placeholder="快速过滤项目..."
-              value={search}
-              onChange={e => setSearch(e.target.value)}
-              className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-sm focus:border-blue-500 outline-none"
-            />
+          <div className="leading-tight">
+            <h2 className="text-white font-black text-lg tracking-tight">管理工作台</h2>
+            <p className="text-[10px] text-slate-500 font-black uppercase tracking-widest">Supabase JWT Auth</p>
           </div>
-          <div className="flex-1 overflow-y-auto custom-scrollbar">
-            {filtered.map(trial => (
-              <div 
-                key={trial.id}
-                onClick={() => handleEditClick(trial)}
-                className={`p-4 border-b border-slate-700/50 cursor-pointer transition-colors ${editingTrial?.id === trial.id ? 'bg-blue-600/20 border-l-4 border-l-blue-500' : 'hover:bg-slate-700/30'}`}
+        </div>
+        
+        <nav className="flex-1 p-6 space-y-2">
+          <button 
+            onClick={() => setActiveTab('data')}
+            className={`w-full flex items-center gap-4 px-5 py-4 rounded-2xl transition-all font-black text-sm ${activeTab === 'data' ? 'bg-indigo-600 text-white shadow-xl shadow-indigo-600/20' : 'hover:bg-slate-800 text-slate-400'}`}
+          >
+            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" /></svg>
+            项目列表管理
+          </button>
+          
+          {role === 'super_admin' && (
+            <>
+              <button 
+                onClick={() => setActiveTab('profiles')}
+                className={`w-full flex items-center gap-4 px-5 py-4 rounded-2xl transition-all font-black text-sm ${activeTab === 'profiles' ? 'bg-purple-600 text-white shadow-xl shadow-purple-600/20' : 'hover:bg-slate-800 text-slate-400'}`}
               >
-                <div className="flex items-center justify-between mb-1">
-                  <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">ID #{trial.id}</span>
-                  <span className="text-[10px] bg-slate-700 px-1.5 py-0.5 rounded text-slate-400">{trial.pi}</span>
-                </div>
-                <h4 className="text-sm font-bold text-white line-clamp-2 leading-tight mb-2">{trial.title}</h4>
-                <div className="text-[11px] text-blue-400 font-bold">{trial.disease}</div>
-              </div>
-            ))}
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z" /></svg>
+                管理员权限分布
+              </button>
+              <button 
+                onClick={() => setActiveTab('logs')}
+                className={`w-full flex items-center gap-4 px-5 py-4 rounded-2xl transition-all font-black text-sm ${activeTab === 'logs' ? 'bg-emerald-600 text-white shadow-xl shadow-emerald-600/20' : 'hover:bg-slate-800 text-slate-400'}`}
+              >
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" /></svg>
+                系统操作日志
+              </button>
+            </>
+          )}
+        </nav>
+
+        <div className="p-6 border-t border-slate-800">
+          <div className="bg-slate-950 p-4 rounded-2xl border border-slate-800 mb-4">
+             <span className="text-[10px] text-slate-600 font-black uppercase tracking-widest block mb-1">当前身份</span>
+             <span className="text-indigo-400 font-black text-xs">{role === 'super_admin' ? '核心超级管理员' : '临床数据管理员'}</span>
           </div>
+          <button onClick={onLogout} className="w-full py-4 bg-slate-800 text-slate-400 hover:text-white rounded-2xl font-black text-xs uppercase tracking-widest transition-all">
+            安全退出
+          </button>
         </div>
+      </aside>
 
-        {/* 右侧编辑器 */}
-        <div className="flex-1 bg-slate-900 overflow-y-auto custom-scrollbar p-8">
-          {editForm ? (
-            <div className="max-w-4xl mx-auto space-y-6 animate-in slide-in-from-right-4 duration-300">
-              <div className="flex items-center justify-between">
-                <h2 className="text-2xl font-black text-white">编辑试验资料</h2>
-                <div className="flex gap-2">
-                   <button 
-                    onClick={() => {setEditingTrial(null); setEditForm(null);}}
-                    className="px-6 py-2 bg-slate-800 text-slate-300 rounded-xl font-bold hover:bg-slate-700 transition-all"
-                  >
-                    取消
-                  </button>
-                  <button 
-                    onClick={handleSave}
-                    className="px-8 py-2 bg-blue-600 text-white rounded-xl font-bold hover:bg-blue-500 shadow-xl shadow-blue-600/20 transition-all"
-                  >
-                    保存修改
-                  </button>
+      <main className="flex-1 flex flex-col overflow-hidden bg-slate-950">
+        <header className="h-20 border-b border-slate-900 flex items-center justify-between px-10 shrink-0">
+          <h2 className="text-xl font-black text-white">
+            {activeTab === 'data' ? '试验数据库' : activeTab === 'profiles' ? '管理员架构' : '系统审计日志'}
+          </h2>
+          {activeTab === 'data' && (
+            <div className="flex gap-4">
+              <button onClick={exportCSV} className="px-5 py-2.5 bg-slate-900 border border-slate-800 text-xs font-black rounded-xl hover:bg-slate-800 transition-all uppercase tracking-widest">导出数据</button>
+              <button onClick={handleAddNew} className="px-6 py-2.5 bg-indigo-600 text-white text-xs font-black rounded-xl hover:bg-indigo-500 shadow-xl shadow-indigo-600/20 transition-all uppercase tracking-widest">+ 新增试验</button>
+            </div>
+          )}
+          {activeTab === 'logs' && (
+            <button onClick={fetchLogs} className="px-5 py-2.5 bg-emerald-600/20 text-emerald-400 border border-emerald-500/30 text-xs font-black rounded-xl hover:bg-emerald-600/30 transition-all">刷新审计流</button>
+          )}
+        </header>
+
+        <div className="flex-1 overflow-hidden flex">
+          {activeTab === 'data' ? (
+            <>
+              <div className="w-96 border-r border-slate-900 flex flex-col">
+                <div className="p-6 border-b border-slate-900">
+                  <input 
+                    type="text" 
+                    placeholder="快速检索..." 
+                    value={search} 
+                    onChange={e => setSearch(e.target.value)} 
+                    className="w-full bg-slate-900 border border-slate-800 rounded-xl px-4 py-3 text-sm focus:border-indigo-500 outline-none transition-all" 
+                  />
+                </div>
+                <div className="flex-1 overflow-y-auto custom-scrollbar">
+                  {filtered.map(trial => (
+                    <div 
+                      key={trial.id} 
+                      onClick={() => handleEditClick(trial)}
+                      className={`p-6 border-b border-slate-900/50 cursor-pointer transition-all ${editingTrial?.id === trial.id ? 'bg-indigo-600/10 border-l-4 border-l-indigo-500' : 'hover:bg-slate-900/30'}`}
+                    >
+                      <div className="flex justify-between items-center mb-1">
+                        <span className="text-[10px] text-slate-600 font-black"># {trial.id}</span>
+                        <span className="text-[10px] bg-slate-900 px-2 py-0.5 rounded text-indigo-400 font-bold">{trial.department}</span>
+                      </div>
+                      <h4 className="text-sm font-black text-slate-200 line-clamp-1">{trial.title}</h4>
+                      <p className="text-[11px] text-slate-500 font-bold mt-1 uppercase tracking-tighter">{trial.disease}</p>
+                    </div>
+                  ))}
                 </div>
               </div>
+              
+              <div className="flex-1 overflow-y-auto custom-scrollbar p-12">
+                {editForm ? (
+                  <div className="max-w-4xl mx-auto space-y-10 animate-in fade-in slide-in-from-bottom-4 duration-500">
+                    <div className="flex justify-between items-center">
+                      <div>
+                        <h3 className="text-3xl font-black text-white">{editForm.id ? `编辑项目 ${editForm.id}` : '创建新临床试验'}</h3>
+                        <p className="text-slate-500 text-sm mt-1">所有更改将实时应用 RLS 权限进行同步</p>
+                      </div>
+                      <button onClick={handleSaveTrial} disabled={isSaving} className="px-10 py-4 bg-emerald-600 text-white rounded-2xl font-black hover:bg-emerald-500 transition-all shadow-2xl shadow-emerald-900/20">
+                        {isSaving ? '正在同步云端...' : '立即发布更改'}
+                      </button>
+                    </div>
 
-              <div className="grid grid-cols-2 gap-6">
-                <div className="space-y-4">
-                   <div className="space-y-1.5">
-                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">科室</label>
-                    <input 
-                      type="text" 
-                      value={editForm.department}
-                      onChange={e => handleFormChange('department', e.target.value)}
-                      className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 focus:border-blue-500 outline-none"
-                    />
+                    <div className="grid grid-cols-2 gap-10">
+                      <div className="space-y-2">
+                        <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest">适应症</label>
+                        <input type="text" value={editForm.disease || ''} onChange={e => setEditForm({...editForm, disease: e.target.value})} className="w-full bg-slate-900 border border-slate-800 rounded-2xl px-5 py-4 font-bold text-indigo-400 outline-none focus:border-indigo-500 shadow-inner" />
+                      </div>
+                      <div className="space-y-2">
+                        <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest">主研究员 (PI)</label>
+                        <input type="text" value={editForm.pi || ''} onChange={e => setEditForm({...editForm, pi: e.target.value})} className="w-full bg-slate-900 border border-slate-800 rounded-2xl px-5 py-4 font-bold outline-none focus:border-indigo-500 shadow-inner" />
+                      </div>
+                    </div>
+
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest">项目完整标题</label>
+                      <textarea rows={3} value={editForm.title || ''} onChange={e => setEditForm({...editForm, title: e.target.value})} className="w-full bg-slate-900 border border-slate-800 rounded-2xl px-5 py-4 font-bold outline-none focus:border-indigo-500 shadow-inner resize-none text-white leading-relaxed" />
+                    </div>
+
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest">详细准入条件</label>
+                      <textarea rows={15} value={editForm.criteria || ''} onChange={e => setEditForm({...editForm, criteria: e.target.value})} className="w-full bg-slate-900 border border-slate-800 rounded-2xl px-6 py-6 text-sm font-medium outline-none focus:border-indigo-500 shadow-inner resize-y leading-loose text-slate-300 antialiased" />
+                    </div>
+
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest text-emerald-500">联系信息</label>
+                      <textarea rows={2} value={editForm.contact || ''} onChange={e => setEditForm({...editForm, contact: e.target.value})} className="w-full bg-slate-900 border border-slate-800 rounded-2xl px-5 py-4 font-black outline-none focus:border-emerald-500 shadow-inner text-emerald-400" />
+                    </div>
                   </div>
-                  <div className="space-y-1.5">
-                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">PI (主要研究者)</label>
-                    <input 
-                      type="text" 
-                      value={editForm.pi}
-                      onChange={e => handleFormChange('pi', e.target.value)}
-                      className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 focus:border-blue-500 outline-none"
-                    />
+                ) : (
+                  <div className="h-full flex flex-col items-center justify-center text-slate-800 italic space-y-4">
+                    <div className="w-20 h-20 bg-slate-900 rounded-full flex items-center justify-center opacity-30">
+                      <svg className="w-10 h-10" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>
+                    </div>
+                    <p className="text-sm font-black uppercase tracking-widest">请选择或创建一个临床项目</p>
                   </div>
+                )}
+              </div>
+            </>
+          ) : activeTab === 'profiles' ? (
+            <div className="flex-1 p-12 overflow-y-auto">
+              <div className="max-w-4xl mx-auto">
+                <div className="bg-indigo-900/10 border border-indigo-500/20 p-8 rounded-3xl mb-10">
+                  <h4 className="text-indigo-400 font-black text-lg mb-2">安全提示</h4>
+                  <p className="text-sm text-slate-400 leading-relaxed">
+                    当前版本已启用 <b>Supabase Auth</b>。增加或删除管理员账号现在需要在 Supabase 控制台的 <b>Authentication</b> 页面操作。
+                  </p>
                 </div>
-                <div className="space-y-4">
-                  <div className="space-y-1.5">
-                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">适应症 (疾病名称)</label>
-                    <input 
-                      type="text" 
-                      value={editForm.disease}
-                      onChange={e => handleFormChange('disease', e.target.value)}
-                      className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 focus:border-blue-500 outline-none text-blue-400 font-bold"
-                    />
-                  </div>
-                  <div className="space-y-1.5">
-                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">标签 (逗号分隔)</label>
-                    <input 
-                      type="text" 
-                      value={editForm.tags.join(', ')}
-                      onChange={e => handleFormChange('tags', e.target.value.split(',').map(s => s.trim()))}
-                      className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 focus:border-blue-500 outline-none"
-                    />
-                  </div>
+                
+                <div className="bg-slate-900 rounded-3xl border border-slate-800 overflow-hidden">
+                  <table className="w-full text-left">
+                    <thead>
+                      <tr className="bg-slate-800/50 border-b border-slate-800">
+                        <th className="px-8 py-5 text-[10px] font-black text-slate-500 uppercase">用户 UUID (Auth ID)</th>
+                        <th className="px-8 py-5 text-[10px] font-black text-slate-500 uppercase text-right">角色权限级别</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800">
+                      {profiles.map(p => (
+                        <tr key={p.user_id} className="hover:bg-slate-800/30 transition-colors">
+                          <td className="px-8 py-5 font-mono text-xs text-slate-400">{p.user_id}</td>
+                          <td className="px-8 py-5 text-right">
+                            <span className={`px-4 py-1.5 rounded-full text-[10px] font-black uppercase tracking-tighter ${p.role === 'super_admin' ? 'bg-purple-500/20 text-purple-400 border border-purple-500/30' : 'bg-indigo-500/20 text-indigo-400 border border-indigo-500/30'}`}>
+                              {p.role === 'super_admin' ? '核心超级管理' : '数据专员'}
+                            </span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                 </div>
-              </div>
-
-              <div className="space-y-1.5">
-                <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">项目完整标题</label>
-                <textarea 
-                  rows={3}
-                  value={editForm.title}
-                  onChange={e => handleFormChange('title', e.target.value)}
-                  className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 focus:border-blue-500 outline-none resize-none font-bold text-white leading-relaxed"
-                />
-              </div>
-
-              <div className="space-y-1.5">
-                <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">入选与排除标准 (长文本)</label>
-                <textarea 
-                  rows={15}
-                  value={editForm.criteria}
-                  onChange={e => handleFormChange('criteria', e.target.value)}
-                  className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 focus:border-blue-500 outline-none resize-y text-sm leading-relaxed"
-                />
-              </div>
-
-              <div className="space-y-1.5">
-                <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">联系方式</label>
-                <textarea 
-                  rows={2}
-                  value={editForm.contact}
-                  onChange={e => handleFormChange('contact', e.target.value)}
-                  className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 focus:border-blue-500 outline-none text-emerald-400 font-bold"
-                />
               </div>
             </div>
           ) : (
-            <div className="h-full flex flex-col items-center justify-center text-slate-500">
-              <div className="w-24 h-24 bg-slate-800 rounded-full flex items-center justify-center mb-6">
-                 <svg className="w-10 h-10" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-                </svg>
+            <div className="flex-1 p-12 overflow-y-auto custom-scrollbar">
+              <div className="max-w-5xl mx-auto">
+                {isLogsLoading ? (
+                  <div className="flex items-center justify-center py-20">
+                    <div className="w-10 h-10 border-4 border-emerald-500 border-t-transparent rounded-full animate-spin"></div>
+                  </div>
+                ) : (
+                  <div className="space-y-6">
+                    {logs.map((log) => (
+                      <div key={log.id} className="group relative pl-8 border-l border-slate-800 pb-8 last:pb-0">
+                        <div className="absolute left-[-5px] top-0 w-2.5 h-2.5 bg-emerald-500 rounded-full shadow-[0_0_10px_rgba(16,185,129,0.5)] group-hover:scale-125 transition-transform"></div>
+                        <div className="bg-slate-900/50 border border-slate-800/50 p-6 rounded-3xl group-hover:bg-slate-900 group-hover:border-emerald-500/20 transition-all">
+                          <div className="flex justify-between items-start mb-3">
+                            <div>
+                              <span className="text-emerald-400 font-black text-sm uppercase tracking-tight">{log.action}</span>
+                              <div className="flex items-center gap-2 mt-1">
+                                <span className="text-[10px] text-slate-500 font-bold">操作员:</span>
+                                <span className="text-[10px] text-slate-300 font-black">{log.user_email}</span>
+                              </div>
+                            </div>
+                            <time className="text-[10px] text-slate-500 font-bold bg-slate-950 px-3 py-1 rounded-full">
+                              {new Date(log.created_at).toLocaleString('zh-CN', { 
+                                year: 'numeric', 
+                                month: '2-digit', 
+                                day: '2-digit', 
+                                hour: '2-digit', 
+                                minute: '2-digit',
+                                second: '2-digit'
+                              })}
+                            </time>
+                          </div>
+                          {log.details && (
+                            <div className="mt-4 p-3 bg-slate-950 rounded-xl font-mono text-[9px] text-slate-500 overflow-x-auto">
+                              {JSON.stringify(log.details)}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                    {logs.length === 0 && (
+                      <div className="text-center py-20 text-slate-600 font-black uppercase tracking-widest italic">
+                        暂无审计记录
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
-              <h3 className="text-xl font-bold text-slate-400">选择左侧项目开始编辑</h3>
-              <p className="mt-2 text-sm max-w-xs text-center">所有修改仅在当前会话生效。若要永久保存，请在修改完成后点击右上角的“导出”按钮并替换原始 JSON 文件。</p>
             </div>
           )}
         </div>
-      </div>
+      </main>
     </div>
   );
 };
