@@ -26,6 +26,14 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ trials, role, onUpdate,
   const [profiles, setProfiles] = useState<AdminProfile[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [isLogsLoading, setIsLogsLoading] = useState(false);
+  
+  // 数据导入相关状态
+  const [showImportModal, setShowImportModal] = useState(false);
+  const [importFile, setImportFile] = useState<File | null>(null);
+  const [isImporting, setIsImporting] = useState(false);
+  const [importProgress, setImportProgress] = useState(0);
+  const [importError, setImportError] = useState<string | null>(null);
+  const [importSuccess, setImportSuccess] = useState<string | null>(null);
 
   useEffect(() => {
     if (activeTab === 'profiles' && role === 'super_admin') {
@@ -140,6 +148,174 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ trials, role, onUpdate,
     document.body.removeChild(link);
   };
 
+  // 数据导入相关函数
+  const handleImportData = () => {
+    setShowImportModal(true);
+    setImportFile(null);
+    setImportError(null);
+    setImportSuccess(null);
+    setImportProgress(0);
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files[0]) {
+      const file = e.target.files[0];
+      if (file.type === 'text/csv' || file.name.endsWith('.csv')) {
+        setImportFile(file);
+        setImportError(null);
+      } else {
+        setImportError('请选择CSV格式的文件');
+        setImportFile(null);
+      }
+    }
+  };
+
+  const parseCSV = (csvText: string): Partial<Trial>[] => {
+    const lines = csvText.split('\n');
+    const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
+    const result: Partial<Trial>[] = [];
+
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+
+      // 处理带引号的CSV字段
+      const values: string[] = [];
+      let currentValue = '';
+      let inQuotes = false;
+
+      for (let j = 0; j < line.length; j++) {
+        const char = line[j];
+        if (char === '"') {
+          inQuotes = !inQuotes;
+        } else if (char === ',' && !inQuotes) {
+          values.push(currentValue.trim().replace(/""/g, '"'));
+          currentValue = '';
+        } else {
+          currentValue += char;
+        }
+      }
+      values.push(currentValue.trim().replace(/""/g, '"'));
+
+      const trial: Partial<Trial> = {};
+      headers.forEach((header, index) => {
+        const value = values[index] || '';
+        switch (header.toLowerCase()) {
+          case '科室':
+          case 'department':
+            trial.department = value;
+            break;
+          case '研究者(pi)':
+          case '研究者':
+          case 'pi':
+            trial.pi = value;
+            break;
+          case '项目标题':
+          case '标题':
+          case 'title':
+            trial.title = value;
+            break;
+          case '适应症':
+          case 'disease':
+            trial.disease = value;
+            break;
+          case '标签':
+          case 'tags':
+            trial.tags = value ? value.split(';').map(tag => tag.trim()) : [];
+            break;
+          case '详细标准':
+          case '标准':
+          case 'criteria':
+            trial.criteria = value;
+            break;
+          case '联系方式':
+          case '联系':
+          case 'contact':
+            trial.contact = value;
+            break;
+        }
+      });
+
+      // 验证必填字段
+      if (trial.title || trial.disease || trial.pi) {
+        result.push(trial);
+      }
+    }
+
+    return result;
+  };
+
+  const handleImportSubmit = async () => {
+    if (!importFile) {
+      setImportError('请选择要导入的CSV文件');
+      return;
+    }
+
+    setIsImporting(true);
+    setImportError(null);
+    setImportSuccess(null);
+    setImportProgress(0);
+
+    try {
+      const reader = new FileReader();
+      reader.onload = async (e) => {
+        try {
+          const csvText = e.target?.result as string;
+          const trialsToImport = parseCSV(csvText);
+
+          if (trialsToImport.length === 0) {
+            setImportError('CSV文件中没有有效的数据');
+            setIsImporting(false);
+            return;
+          }
+
+          // 批量导入数据
+          const batchSize = 10;
+          const total = trialsToImport.length;
+          let imported = 0;
+
+          for (let i = 0; i < total; i += batchSize) {
+            const batch = trialsToImport.slice(i, i + batchSize);
+            const { error } = await supabase.from('trials').insert(batch);
+            
+            if (error) {
+              throw error;
+            }
+
+            imported += batch.length;
+            setImportProgress(Math.round((imported / total) * 100));
+          }
+
+          // 记录导入日志
+          await logAction('批量导入试验项目', {
+            count: total,
+            fileName: importFile.name
+          });
+
+          setImportSuccess(`成功导入 ${total} 个试验项目`);
+          onUpdate();
+
+          // 3秒后关闭模态框
+          setTimeout(() => {
+            setShowImportModal(false);
+          }, 3000);
+        } catch (error: any) {
+          setImportError(`导入失败: ${error.message}`);
+        } finally {
+          setIsImporting(false);
+        }
+      };
+      reader.onerror = () => {
+        setImportError('文件读取失败');
+        setIsImporting(false);
+      };
+      reader.readAsText(importFile, 'UTF-8');
+    } catch (error: any) {
+      setImportError(`导入失败: ${error.message}`);
+      setIsImporting(false);
+    }
+  };
+
   return (
     <div className="flex h-screen bg-slate-950 text-slate-300">
       <aside className="w-72 bg-slate-900 border-r border-slate-800 flex flex-col shrink-0">
@@ -200,6 +376,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ trials, role, onUpdate,
           </h2>
           {activeTab === 'data' && (
             <div className="flex gap-4">
+              <button onClick={handleImportData} className="px-5 py-2.5 bg-slate-900 border border-slate-800 text-xs font-black rounded-xl hover:bg-slate-800 transition-all uppercase tracking-widest">导入数据</button>
               <button onClick={exportCSV} className="px-5 py-2.5 bg-slate-900 border border-slate-800 text-xs font-black rounded-xl hover:bg-slate-800 transition-all uppercase tracking-widest">导出数据</button>
               <button onClick={handleAddNew} className="px-6 py-2.5 bg-indigo-600 text-white text-xs font-black rounded-xl hover:bg-indigo-500 shadow-xl shadow-indigo-600/20 transition-all uppercase tracking-widest">+ 新增试验</button>
             </div>
@@ -375,6 +552,103 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ trials, role, onUpdate,
           )}
         </div>
       </main>
+
+      {/* 数据导入模态框 */}
+      {showImportModal && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-950/80 backdrop-blur-md p-4">
+          <div className="bg-slate-900 w-full max-w-md rounded-[2.5rem] shadow-3xl overflow-hidden border border-slate-800 animate-in zoom-in duration-300">
+            <div className="p-10">
+              <div className="text-center mb-10">
+                <div className="w-20 h-20 bg-indigo-600 rounded-3xl flex items-center justify-center text-white mx-auto mb-6 shadow-2xl shadow-indigo-600/40">
+                  <svg className="w-10 h-10" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                  </svg>
+                </div>
+                <h2 className="text-3xl font-black text-white">批量导入数据</h2>
+                <p className="text-slate-500 text-sm mt-2">请选择CSV格式的文件进行导入</p>
+              </div>
+
+              <div className="space-y-6">
+                <div>
+                  <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2 ml-1">选择文件</label>
+                  <div className={`border-2 border-dashed ${importFile ? 'border-emerald-500 bg-emerald-900/10' : 'border-slate-700 bg-slate-800/50'} rounded-2xl p-8 text-center transition-all`}>
+                    <input
+                      type="file"
+                      accept=".csv"
+                      onChange={handleFileChange}
+                      className="hidden"
+                      id="file-upload"
+                    />
+                    <label
+                      htmlFor="file-upload"
+                      className={`cursor-pointer ${importFile ? 'text-emerald-400' : 'text-slate-400'} transition-colors`}
+                    >
+                      <svg className="w-12 h-12 mx-auto mb-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                      </svg>
+                      <p className="font-bold">{importFile ? importFile.name : '点击或拖拽文件到此处'}</p>
+                      <p className="text-xs text-slate-600 mt-1">支持CSV格式文件</p>
+                    </label>
+                  </div>
+                </div>
+
+                {importProgress > 0 && (
+                  <div className="space-y-2">
+                    <div className="flex justify-between text-xs font-black">
+                      <span className="text-slate-400">导入进度</span>
+                      <span className="text-indigo-400">{importProgress}%</span>
+                    </div>
+                    <div className="h-2 bg-slate-800 rounded-full overflow-hidden">
+                      <div 
+                        className="h-full bg-indigo-600 transition-all duration-300 ease-out"
+                        style={{ width: `${importProgress}%` }}
+                      ></div>
+                    </div>
+                  </div>
+                )}
+
+                {importError && (
+                  <div className="p-4 bg-red-900/20 text-red-400 text-xs font-bold rounded-2xl border border-red-500/20 flex items-center gap-3">
+                    <div className="w-1.5 h-1.5 bg-red-600 rounded-full animate-ping"></div>
+                    {importError}
+                  </div>
+                )}
+
+                {importSuccess && (
+                  <div className="p-4 bg-emerald-900/20 text-emerald-400 text-xs font-bold rounded-2xl border border-emerald-500/20 flex items-center gap-3">
+                    <div className="w-1.5 h-1.5 bg-emerald-600 rounded-full animate-ping"></div>
+                    {importSuccess}
+                  </div>
+                )}
+
+                <div className="flex flex-col gap-4 pt-4">
+                  <button
+                    onClick={handleImportSubmit}
+                    disabled={isImporting || !importFile}
+                    className="w-full py-5 bg-indigo-600 text-white rounded-2xl font-black shadow-xl shadow-indigo-600/20 hover:bg-indigo-700 active:scale-[0.97] transition-all flex items-center justify-center gap-3"
+                  >
+                    {isImporting ? (
+                      <>
+                        <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
+                        正在导入...
+                      </>
+                    ) : (
+                      '开始导入'
+                    )}
+                  </button>
+                  <button
+                    onClick={() => setShowImportModal(false)}
+                    disabled={isImporting}
+                    className="w-full py-4 bg-slate-800 text-slate-400 rounded-2xl font-bold hover:bg-slate-700 transition-all text-xs uppercase tracking-widest"
+                  >
+                    取消
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
